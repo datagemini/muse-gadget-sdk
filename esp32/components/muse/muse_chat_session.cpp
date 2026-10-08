@@ -230,6 +230,9 @@ struct turn_t {
     char committed[512];     /* finals that arrived before the half-close */
     char partial[512];
     char user_ids[2][80];
+    char transcript[TEXT_MAX], transcript_id[80];
+    char retry_parents[2][80];
+    bool text_retry;          /* at most one text retry for an empty voice reply */
     muse_chat_rejected_t rejected;
     msg_t msgs[MAX_MSGS];
     int nmsgs;
@@ -1307,6 +1310,12 @@ static int bind_msg(const char *id, cJSON *payload)
     if (!parent) {
         parent = cJSON_GetStringValue(cJSON_GetObjectItem(payload, "parent_message_id"));
     }
+    /* Late events from the original voice note must not enter the text retry. */
+    if (s_turn.text_retry && parent && parent[0] && !is_user_id(parent)
+        && (!strcmp(parent, s_turn.retry_parents[0]) || !strcmp(parent, s_turn.retry_parents[1]))) {
+        muse_chat_reject(&s_turn.rejected, id);
+        return -1;
+    }
     /* Once the ack names our message, replies to anything else are someone else's. */
     if (parent && parent[0] && s_turn.acked && !is_user_id(parent) && find_msg(parent) < 0) {
         muse_chat_reject(&s_turn.rejected, id);
@@ -1440,6 +1449,25 @@ static void on_event(cJSON *line)
             muse_hatch_console("busy", nullptr, "\"on\":%s", s_turn.agent_busy ? "true" : "false");
         }
         s_turn.last_event_us = now_us();
+        return;
+    }
+    if (!s_turn.text && !s_turn.text_retry && !strcmp(event, "message.user")) {
+        if (cJSON_IsFalse(cJSON_GetObjectItem(payload, "display_text_ready"))) return;
+        const char *id = msg_id(payload, line);
+        const char *heard = cJSON_GetStringValue(cJSON_GetObjectItem(payload, "display_text"));
+        if (!heard) heard = cJSON_GetStringValue(cJSON_GetObjectItem(payload, "content"));
+        if (!heard) heard = cJSON_GetStringValue(cJSON_GetObjectItem(payload, "text"));
+        if (id && heard && (!s_turn.acked || is_user_id(id))) {
+            const char *attachment = strstr(heard, "\n[file:");
+            size_t n = attachment ? (size_t)(attachment - heard) : strlen(heard);
+            while (n && isspace((unsigned char)heard[n - 1])) n--;
+            /* Never submit a truncated transcript or the pending placeholder. */
+            if (n && n < sizeof(s_turn.transcript) && strncmp(heard, "[Voice note]", n)) {
+                memcpy(s_turn.transcript, heard, n);
+                s_turn.transcript[n] = '\0';
+                strlcpy(s_turn.transcript_id, id, sizeof(s_turn.transcript_id));
+            }
+        }
         return;
     }
     bool start = !strcmp(event, "delta.message_start");
@@ -1647,6 +1675,33 @@ static void decode(void)
     }
 }
 
+/* The voice-note endpoint can acknowledge/transcribe a note but finish with
+ * an empty reply (#87). Retry its correlated transcript once as a text turn;
+ * do not retry a timeout, a partial response, or a typed command. */
+static bool retry_empty_voice_reply(void)
+{
+    if (s_turn.text || s_turn.text_retry || !s_turn.acked
+        || !s_turn.transcript[0] || !is_user_id(s_turn.transcript_id)) return false;
+    for (int i = 0; i < s_turn.nmsgs; i++) {
+        muse_chat_reject(&s_turn.rejected, s_turn.msgs[i].id);
+    }
+    memcpy(s_turn.retry_parents, s_turn.user_ids, sizeof(s_turn.retry_parents));
+    send_reset(s_turn.chat_id);
+    s_turn.chat_id = 0;
+    s_turn.text_retry = true;
+    s_turn.acked = false;
+    memset(s_turn.user_ids, 0, sizeof(s_turn.user_ids));
+    memset(s_turn.msgs, 0, sizeof(s_turn.msgs));
+    s_turn.nmsgs = 0;
+    s_turn.tts_msg = -1;
+    s_turn.last_content_us = 0;
+    s_reply_shown[0] = '\0';
+    ESP_LOGW(TAG, "empty voice reply: retrying the transcript once as text");
+    emit(MUSE_HATCH_EV_HEARD, "RETRYING AS TEXT");
+    send_chat(s_turn.transcript, "text");
+    return true;
+}
+
 /* Ends the turn once the reply is complete and spoken, or on timeouts. */
 static void check_turn(void)
 {
@@ -1686,6 +1741,14 @@ static void check_turn(void)
     }
     if (s_turn.agent_busy && t - s_turn.last_content_us < (text ? TEXT_BUSY_HOLD_US : BUSY_HOLD_US)) {
         return;
+    }
+    if (!text) {
+        bool empty = true;
+        for (int i = 0; i < s_turn.nmsgs; i++) empty = empty && !s_turn.msgs[i].len;
+        if (empty) {
+            if (!retry_empty_voice_reply()) turn_fail("EMPTY REPLY: SEE MUSE APP");
+            return;
+        }
     }
     ESP_LOGI(TAG, "turn done: %d message(s) in %.1fs", s_turn.nmsgs, (t - s_turn.start_us) / 1e6);
     log_marks();

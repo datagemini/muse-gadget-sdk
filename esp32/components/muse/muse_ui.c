@@ -1246,7 +1246,11 @@ static void update_chrome(float now)
                 strlcpy(hint, "Tap to confirm pairing", sizeof(hint));
             } else {
                 strlcpy(code, s_small ? "Press" : "Press button", sizeof(code));
+#if CONFIG_MUSE_BOARD_WAVESHARE_S3_175C
+                strlcpy(hint, "Press BOOT", sizeof(hint));
+#else
                 snprintf(hint, sizeof(hint), s_small ? "%s button" : "Press the %s button", muse_board->talk_button);
+#endif
             }
         } else {
             snprintf(code, sizeof(code), "%06lu", (unsigned long)b.passkey);

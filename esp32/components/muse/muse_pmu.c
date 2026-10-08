@@ -26,6 +26,7 @@ static const char *TAG = "muse_pmu";
 #define REG_STATUS1 0x00        /* bit5 VBUS good, bit3 battery present */
 #define REG_STATUS2 0x01        /* bits[6:5] 01 = charging */
 #define REG_COMMON_CFG 0x10     /* bit0 = soft power-off */
+#define REG_PWROFF_EN 0x22      /* bit1: long-press enable; bit0: restart instead of off */
 #define REG_IRQ_LEVEL 0x27      /* bits[3:2] power-key hold-to-off time */
 #define REG_ADC_ENABLE 0x30     /* bit0 = battery voltage */
 #define REG_VBAT_H 0x34         /* bits[4:0]; 1 mV per count with REG_VBAT_L */
@@ -75,6 +76,11 @@ esp_err_t muse_pmu_init(i2c_master_bus_handle_t bus, bool key_irqs)
     uint8_t v;
     ESP_RETURN_ON_ERROR(rd(REG_IRQ_LEVEL, &v), TAG, "AXP2101 not responding");
     ESP_RETURN_ON_ERROR(wr(REG_IRQ_LEVEL, (v & ~0x0C) | PKEY_OFF_10S), TAG, "set off time");
+
+    /* Select power-off rather than restart, and explicitly enable the
+     * hardware fallback. It must work even if the input/UI task is stuck. */
+    ESP_RETURN_ON_ERROR(rd(REG_PWROFF_EN, &v), TAG, "read power-off enable");
+    ESP_RETURN_ON_ERROR(wr(REG_PWROFF_EN, (v | 0x02) & ~0x01), TAG, "enable long-press power-off");
 
     if (key_irqs) {
         ESP_RETURN_ON_ERROR(rd(REG_INTEN2, &v), TAG, "read inten2");
