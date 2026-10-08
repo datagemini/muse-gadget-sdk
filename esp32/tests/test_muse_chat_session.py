@@ -24,9 +24,11 @@ class ChatSession(unittest.TestCase):
         constants = source[source.index('#define MIC_RATE'):source.index('/* ---- Voice task')]
         types = source[source.index('enum phase_t'):source.index('/* 10 KB')]
         handlers = source[source.index('static int find_msg('):source.index('static void on_chat_ack(')]
+        recovery = source[source.index('static bool retry_empty_voice_reply('):source.index('/* ---- Inbound dispatch ---- */')]
         reset = source[source.index('static bool turn_start('):source.index('static void turn_begin(')]
         code = r'''
 #include <cassert>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -37,14 +39,18 @@ class ChatSession(unittest.TestCase):
 #include "minimp3.h"
 #include "muse_chat_priv.h"
 #define ESP_LOGI(...) ((void)0)
+#define ESP_LOGW(...) ((void)0)
 ''' + constants + types + r'''
 static turn_t s_turn;
 static char s_reply_shown[EV_TEXT];
 static int64_t s_last_seq, s_marks[4];
-static int captions, console_events;
+static int captions, console_events, retries;
+static int64_t clock_us = 12345;
+static char submitted[TEXT_MAX];
+static bool fail_submit;
 enum mark_t { M_TEXT, M_DONE };
 static void mark(mark_t) {}
-static int64_t now_us() { return 12345; }
+static int64_t now_us() { return clock_us; }
 static void emit(muse_hatch_ev_t type, const char *) {
     if (type == MUSE_HATCH_EV_REPLY) captions++;
 }
@@ -59,6 +65,18 @@ static bool ensure_connected() { return true; }
 bool muse_hatch_configured() { return true; }
 static void resampler_init(resampler_t *, int, int) {}
 ''' + reset + handlers + r'''
+static void send_reset(int64_t) {}
+static void on_dictation_end(bool) {}
+static void log_marks() {}
+static void turn_done(bool) { turn_finish(); }
+static void send_chat(const char *text, const char *modality) {
+    assert(!strcmp(modality, "text"));
+    strlcpy(submitted, text, sizeof(submitted)); retries++;
+    if (fail_submit) { turn_fail("CAN'T REACH MUSE"); return; }
+    s_turn.chat_us = s_turn.last_event_us = now_us();
+    s_turn.phase = P_WAIT_REPLY;
+}
+''' + recovery + r'''
 static void begin(bool typed = false) {
     assert(turn_start(s_turn.gen + 1, typed));
     s_turn.phase = P_WAIT_REPLY;
@@ -128,12 +146,80 @@ static void bounded_rejections() {
     event("message.assistant", "second", "note", "Second");
     assert(s_turn.nmsgs == 2 && s_turn.msgs[0].done && s_turn.msgs[1].done);
 }
+
+static void voice_transcript(const char *text = "你好，今天怎么样？\n[file:audio/wav voice_note.wav]") {
+    event("message.user", "note", "", text);
+}
+static void settle() { clock_us += SETTLE_US + 1; check_turn(); }
+static void recover_voice() {
+    begin(); voice_transcript();
+    event("delta.message_done", "empty", "note");
+    check_turn(); assert(!retries); /* no immediate retry */
+    settle(); assert(retries == 1 && s_turn.text_retry && !s_turn.text);
+    assert(!strcmp(submitted, "你好，今天怎么样？"));
+    assert(!s_turn.nmsgs && !s_turn.acked && s_turn.phase == P_WAIT_REPLY);
+    event("message.assistant", "empty", "", "Late original reply");
+    event("message.assistant", "late", "note", "Late sibling");
+    assert(!s_turn.nmsgs);
+    s_turn.acked = true; strlcpy(s_turn.user_ids[0], "retry", sizeof(s_turn.user_ids[0]));
+    event("message.assistant", "good", "retry", "Recovered");
+    s_turn.msgs[0].tts = TTS_FINISHED;
+    settle(); assert(s_turn.phase == P_IDLE && retries == 1);
+}
+static void bounded_retry() {
+    begin(); voice_transcript(); event("delta.message_done", "empty", "note"); settle();
+    s_turn.acked = true; strlcpy(s_turn.user_ids[0], "retry", sizeof(s_turn.user_ids[0]));
+    event("delta.message_done", "empty-again", "retry"); settle();
+    assert(retries == 1 && s_turn.phase == P_IDLE);
+    begin(); assert(!s_turn.text_retry && !s_turn.transcript[0]);
+}
+static void no_unsafe_retry() {
+    begin(); voice_transcript();
+    event("message.assistant", "normal", "note", "Valid answer");
+    s_turn.msgs[0].tts = TTS_FINISHED; settle(); assert(!retries && s_turn.phase == P_IDLE);
+    begin(true); event("delta.message_done", "empty", "note"); settle(); assert(!retries);
+    begin(); event("message.user", "other", "", "Wrong transcript");
+    event("delta.message_done", "empty", "note"); settle(); assert(!retries && s_turn.phase == P_IDLE);
+    begin();
+    cJSON *pending = cJSON_Parse(R"({"type":"event","event":"message.user","payload":{"message_id":"note","display_text":"Partial transcription","display_text_ready":false}})");
+    on_event(pending); cJSON_Delete(pending);
+    event("delta.message_done", "empty", "note"); settle(); assert(!retries);
+    begin(); voice_transcript("[Voice note]");
+    event("delta.message_done", "empty", "note"); settle(); assert(!retries);
+    begin(); voice_transcript(); clock_us += REPLY_TIMEOUT_US + 1; check_turn();
+    assert(!retries && s_turn.phase == P_IDLE); /* no reply/timeout is not an empty final */
+    begin(); voice_transcript(); s_turn.transcript_id[0] = 0;
+    event("delta.message_done", "empty", "note"); settle(); assert(!retries);
+    begin(); char large[TEXT_MAX+4]; memset(large, 'x', sizeof(large)-1); large[sizeof(large)-1]=0;
+    voice_transcript(large); event("delta.message_done", "empty", "note"); settle(); assert(!retries);
+}
+static void deferred_and_failed_retry() {
+    begin(); event("delta.message_done", "empty", "note"); voice_transcript();
+    s_turn.agent_busy = true; settle(); assert(!retries);
+    s_turn.agent_busy = false; check_turn(); assert(retries == 1);
+    begin(); voice_transcript(); event("delta.message_done", "empty", "note");
+    fail_submit = true; settle(); assert(retries == 2 && s_turn.phase == P_IDLE);
+}
+static void early_transcript_and_partial() {
+    begin(); s_turn.acked = false; voice_transcript(); s_turn.acked = true;
+    event("delta.message_done", "empty", "note"); settle(); assert(retries == 1);
+    begin(); s_turn.acked = false; event("message.user", "other", "", "Wrong early transcript");
+    s_turn.acked = true; event("delta.message_done", "empty", "note"); settle(); assert(retries == 1);
+    begin(); voice_transcript(); event("delta.text_append", "partial", "note", "Some text");
+    clock_us += SETTLE_US + 1; check_turn(); assert(retries == 1 && s_turn.phase == P_WAIT_REPLY);
+}
+
 int main(int argc, char **argv) {
     assert(argc == 2);
     switch (atoi(argv[1])) {
     case 0: rejected_deltas(); break;
     case 1: valid_parents(); break;
     case 2: bounded_rejections(); break;
+    case 3: recover_voice(); break;
+    case 4: bounded_retry(); break;
+    case 5: no_unsafe_retry(); break;
+    case 6: deferred_and_failed_retry(); break;
+    case 7: early_transcript_and_partial(); break;
     default: return 2;
     }
 }
@@ -166,3 +252,18 @@ int main(int argc, char **argv) {
 
     def test_rejection_capacity_preserves_correlation(self):
         self.run_case(2)
+
+    def test_empty_voice_reply_retries_correlated_transcript_and_drops_stale_replies(self):
+        self.run_case(3)
+
+    def test_empty_reply_retry_is_limited_to_one_and_resets_next_turn(self):
+        self.run_case(4)
+
+    def test_normal_typed_uncorrelated_placeholder_long_and_timeout_turns_do_not_retry(self):
+        self.run_case(5)
+
+    def test_busy_agent_defers_retry_and_send_failure_ends_turn(self):
+        self.run_case(6)
+
+    def test_transcript_before_ack_and_partial_reply_do_not_break_correlation(self):
+        self.run_case(7)
