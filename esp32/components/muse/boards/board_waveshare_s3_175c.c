@@ -17,8 +17,8 @@
 /*
  * Waveshare ESP32-S3-Touch-AMOLED-1.75C: round 466 px CO5300 AMOLED with
  * CST9217 touch, ES8311 speaker + ES7210 dual mic, AXP2101 PMU. The top
- * button (PWR) is wired to the PMU and, through an inverter, to GPIO3; the
- * bottom one is BOOT (GPIO0).
+ * button (PWR) is read from the PMU key latch, avoiding the unreliable
+ * inverter path to GPIO3. BOOT (GPIO0) is push-to-talk.
  *
  * The ESP32-S3-Touch-AMOLED-1.75 (CONFIG_MUSE_BOARD_WAVESHARE_S3_175) runs
  * this driver too. Its BSP moves the panel and touch resets to GPIO 39 and 40
@@ -45,34 +45,18 @@ static const char *TAG = "board";
 
 #define DRAW_BUF_LINES 118      /* four bands to the screen (muse_lcd_bands.h) */
 #define LCD_CHUNK_BYTES (BSP_LCD_H_RES * 8 * 2)
-#if CONFIG_MUSE_BOARD_WAVESHARE_S3_175
 #define PMU_KEY_EVERY 2         /* poll the PMU over I2C every 20 ms */
-#else
-#define PWR_GPIO GPIO_NUM_3    /* high while PWR is held (a BSS138 inverts it) */
-#endif
 
 static esp_lcd_panel_io_handle_t s_io;
 static esp_lcd_touch_handle_t s_tp;
 static muse_gpio_button_t s_boot;
-#if !CONFIG_MUSE_BOARD_WAVESHARE_S3_175
-static muse_gpio_button_t s_pwr;
-#endif
 
 static esp_err_t init(void)
 {
     ESP_RETURN_ON_ERROR(bsp_i2c_init(), TAG, "i2c init");
     ESP_RETURN_ON_ERROR(muse_gpio_button_init(&s_boot, GPIO_NUM_0), TAG, "boot button");
-#if CONFIG_MUSE_BOARD_WAVESHARE_S3_175
-    /* Only the PMU sees PWR: latch its edges for poll_buttons(). */
+    /* The PMU sees PWR on both boards; latch its edges even without GPIO3. */
     esp_err_t err = muse_pmu_init(bsp_i2c_get_handle(), true);
-#else
-    ESP_RETURN_ON_ERROR(muse_gpio_button_init_high(&s_pwr, PWR_GPIO), TAG, "pwr button");
-    /* PWR turned the board on and may still be held; don't count that as a press. */
-    s_pwr.pressed = gpio_get_level(PWR_GPIO) == 1;
-    /* GPIO3 gives the key, so the PMU needn't latch it. Its IRQ line isn't
-     * wired to the ESP32. */
-    esp_err_t err = muse_pmu_init(bsp_i2c_get_handle(), false);
-#endif
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "PMU unavailable (%s): battery status disabled", esp_err_to_name(err));
         return ESP_OK;
@@ -214,7 +198,6 @@ static void set_mic_gain(esp_codec_dev_handle_t mic, int db)
     esp_codec_dev_set_in_gain(mic, db == 33 ? 34.5f : (float)db);
 }
 
-#if CONFIG_MUSE_BOARD_WAVESHARE_S3_175
 static unsigned poll_buttons(void)
 {
     static unsigned tick;
@@ -226,17 +209,6 @@ static unsigned poll_buttons(void)
     }
     return ev;
 }
-#else
-static unsigned poll_buttons(void)
-{
-    return muse_gpio_button_poll(&s_pwr) | muse_gpio_button_poll(&s_boot) << 2;   /* BOOT is aux */
-}
-
-static void wait_buttons(int timeout_ms)
-{
-    muse_gpio_buttons_wait((muse_gpio_button_t *const[]){ &s_pwr, &s_boot }, 2, timeout_ms);
-}
-#endif
 
 static const muse_board_t s_board = {
 #if CONFIG_MUSE_BOARD_WAVESHARE_S3_175
@@ -256,11 +228,11 @@ static const muse_board_t s_board = {
     .talk_hint = { LV_ALIGN_CENTER, 153, 129 },
     .aux_hint = { LV_ALIGN_CENTER, 153, -129 },
 #else
-    .talk_button = "top",
-    .aux_button = "bottom",
-    /* Side buttons: PWR (talk) above BOOT (sleep/off), on the right. */
-    .talk_hint = { LV_ALIGN_CENTER, 153, -129 },    /* 40 degrees above/below 3 o'clock */
-    .aux_hint = { LV_ALIGN_CENTER, 153, 129 },
+    .talk_button = "bottom",
+    .aux_button = "top",
+    /* BOOT (talk) below PWR (sleep/off), on the right. */
+    .talk_hint = { LV_ALIGN_CENTER, 153, 129 },
+    .aux_hint = { LV_ALIGN_CENTER, 153, -129 },
 #endif
     .frame_ms = 40,
     .init = init,
@@ -274,9 +246,7 @@ static const muse_board_t s_board = {
     .mic_slot = -1,
     .set_mic_gain = set_mic_gain,
     .poll_buttons = poll_buttons,
-#if !CONFIG_MUSE_BOARD_WAVESHARE_S3_175
-    .wait_buttons = wait_buttons,   /* the 1.75's PWR is on the PMU, so it's polled */
-#endif
+    /* PWR has no ESP32 IRQ wire: poll it even while the display rests. */
     .read_power = muse_pmu_read_power,
     .power_off = muse_pmu_power_off,
 };
