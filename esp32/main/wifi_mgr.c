@@ -194,6 +194,34 @@ static void event_handler(void *arg, esp_event_base_t base,
     }
 }
 
+/* This local 1.75C build uses the user's fixed LAN settings. Configure the
+ * interface before starting Wi-Fi; the normal connected handler then emits
+ * GOT_IP for the static address on both initial association and reconnect. */
+static esp_err_t configure_static_network(void) {
+#if CONFIG_MUSE_BOARD_WAVESHARE_S3_175C
+    esp_err_t err = esp_netif_dhcpc_stop(s_sta_netif);
+    if (err != ESP_OK && err != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STOPPED) return err;
+
+    esp_netif_ip_info_t ip = {0};
+    if ((err = esp_netif_str_to_ip4("10.0.0.228", &ip.ip)) != ESP_OK) return err;
+    if ((err = esp_netif_str_to_ip4("255.255.255.0", &ip.netmask)) != ESP_OK) return err;
+    if ((err = esp_netif_str_to_ip4("10.0.0.10", &ip.gw)) != ESP_OK) return err;
+    if ((err = esp_netif_set_ip_info(s_sta_netif, &ip)) != ESP_OK) return err;
+
+    esp_netif_dns_info_t dns = {0};
+    dns.ip.type = ESP_IPADDR_TYPE_V4;
+    if ((err = esp_netif_str_to_ip4("10.0.0.10", &dns.ip.u_addr.ip4)) != ESP_OK) return err;
+    const esp_netif_dns_type_t types[] = {
+        ESP_NETIF_DNS_MAIN, ESP_NETIF_DNS_BACKUP, ESP_NETIF_DNS_FALLBACK
+    };
+    for (unsigned i = 0; i < sizeof(types) / sizeof(types[0]); i++) {
+        if ((err = esp_netif_set_dns_info(s_sta_netif, types[i], &dns)) != ESP_OK) return err;
+    }
+    ESP_LOGI(TAG, "static Wi-Fi: IP 10.0.0.228/24, gateway 10.0.0.10, DNS 10.0.0.10");
+#endif
+    return ESP_OK;
+}
+
 void wifi_mgr_init(void) {
     if (s_inited) return;
     s_events = xEventGroupCreate();
@@ -203,6 +231,7 @@ void wifi_mgr_init(void) {
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     s_sta_netif = esp_netif_create_default_wifi_sta();
+    ESP_ERROR_CHECK(configure_static_network());
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
